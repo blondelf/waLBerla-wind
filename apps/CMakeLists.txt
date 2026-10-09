@@ -1,0 +1,14 @@
+add_subdirectory(AppGenerator EXCLUDE_FROM_ALL)
+
+add_subdirectory(LBM_CPU)
+add_subdirectory(LBM_CPU_CP)
+add_subdirectory(LBM_CPU_AMR)
+add_subdirectory(LBM_GPU)
+add_subdirectory(LBM_GPU_CP)
+
+add_subdirectory(GeneratedApp_cpu_uniform)
+add_subdirectory(GeneratedApp_cpu_staticRefinement)
+add_subdirectory(GeneratedApp_gpu_uniform)
+add_subdirectory(GeneratedApp_gpu_staticRefinement)
+
+add_subdirectory(BenchmarkApp_gpu_staticRefinement)

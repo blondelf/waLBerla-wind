@@ -1,0 +1,115 @@
+DomainSetup
+{
+    domainSize    < 270, 180, 120>;
+
+    loadSnapshot            0;
+    storeSnapshot           0;
+    snapshotFrequency       4914;
+    snapshotBaseFolder snapsnap;
+    snapshotConfigFile config.snap;
+    welfordFile welford.snap;
+    snapshotBlockforestFile blockForest.snap;
+    snapshotPdfFile pdfs.snap;
+    snapshotForceFile forces.snap;
+    snapshotMeanVelFile meanU.snap;
+    snapshotSOPFile SOP.snap;
+
+}
+
+Parameters
+{
+    initialVelocity < 0.05773502691896259, 0, 0 >;
+    timesteps              4914;
+
+    length_SI              4.5;
+    length_LU              15;
+
+    velocity_SI            10.05;
+    velocity_LU            0.05773502691896259;
+
+    viscosity_SI           1.82e-05;
+    density_SI             1.197;
+
+    gaussianSigma     2.0;
+
+    useGui 0;
+    remainingTimeLoggerFrequency 5; // in seconds
+
+    innerOuterSplit < 8, 1, 1>;     // slice-thickness that 'outer'-kernels process when overlapping
+    gpuBlockSize < 64, 1, 1>;
+
+    referenceHeight_LU 60.0;
+    samplingHeight_LU  40;
+    velocityFilterWidth   1e-3;
+
+
+    driverType pressure;
+    roughnessLengthRatio 5e-05;                // z0 / zHub / C_l
+    kappa 0.42;
+}
+
+Initialisation {
+    type logLaw;
+    initialVelocity <0.05773502691896259, 0, 0>;
+}
+
+Boundaries
+{
+    setup                   Open;
+    wallType                WFB;
+    inflowType              UniformInflow;
+    outflowType             Outflow;
+
+    inflowVelocity          <0.05773502691896259, 0, 0>;
+    outflowPressure         1.0;
+}
+
+WindFarm{
+
+    outputFolder  TurbineOutput;
+    startingTimeStepForces 1;
+    frequencyOutputForces 1;
+
+    Turbine1
+	{
+	    basePoint             <75.0,90,60.0>;
+	    diameter_LU             15;
+	    hubRotationalVelocity       <0,0,44.5163679>;
+	    towerDescription   Mexico.tower;
+	    bladeDescription   Mexico.blade;
+	    towerEffect     0;
+	    nacelleEffect   0;
+	    tipLoss         1;
+	    nPointsBlades   50;
+	    nPointsTower    2;
+	    nBlades         3;
+	    nacelleYaw      0;
+	    hubRadius_SI    0.21;
+	    hubDeport_SI    0.0;
+	    hubTilt         0.0;
+	    bladePitch      -2.3000244769936637;
+	    bladePrecone    0.0;
+	    aeroModel       actuatorLine;
+	}
+}
+
+Output{
+
+    welfordIntervalOutput 819;
+
+    VTK
+    {
+        writeFrequency 819;
+        ghostLayers    0;
+
+        baseFolder           vtk_out;
+        executionFolder      simulation_step;
+
+        fields {
+            // Density;
+            Velocity;
+            meanVelocity;
+            sumofsquares;
+        }
+    }
+}

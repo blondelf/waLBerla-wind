@@ -1,0 +1,900 @@
+#include <iostream>
+#include <cmath>
+#include <vector>
+#include <functional>
+
+#include <blockforest/Initialization.h>
+#include <blockforest/loadbalancing/DynamicCurve.h>
+#include <blockforest/loadbalancing/NoPhantomData.h>
+#include <core/all.h>
+#include <core/Environment.h>
+#include <core/mpi/all.h>
+#include <domain_decomposition/all.h>
+#include <field/all.h>
+#include <geometry/all.h>
+#include <lbm/all.h>
+#include <lbm/vtk/all.h>
+#include <lbm_generated/field/AddToStorage.h>
+#include <lbm_generated/gpu/NonuniformGPUCommData.h>
+#include <timeloop/all.h>
+
+#include "conversion/Conversion.h"
+#include "domain/BoundaryHandling.h"
+#include "domain/BoundarySetter.h"
+#include "domain/BoundarySetup.h"
+#include "domain/DomainInitialiser.h"
+#include "domain/DomainSetup.h"
+#include "farm_creator/WindFarm.h"
+#include "farm_creator/ConfigTurbineCreator.h"
+#include "output/Logging.h"
+#include "output/TurbineOutput.h"
+#include "walberla_helper/field/all.h"
+#include "wind_turbine_core/ProjectDefines.h"
+
+#include "waLBerlaWind_KernelInfo.h"
+
+namespace turbine_core {
+
+    static const uint_t fieldGhostLayers =  2 ;
+
+    // define different interpolators and distributors
+
+    template<class Kernel_T>
+    using KernelFieldInterpolator_T = projectors::KernelFieldInterpolator<field::Field<real_t>, Kernel_T>;
+
+    template<class Kernel_T>
+    using KernelDistributor_T = projectors::KernelFieldDistributor<field::Field<real_t>, Kernel_T>;
+
+    using InterpolationKernel_T = projectors::SmoothedDiracDeltaKernel;
+    using DistributionKernel_T = projectors::SmoothedDiracDeltaKernel;
+
+    using WindFarm_T = WindFarm<topology::gpu::Tree, creator::ConfigTurbineCreator,
+            ScalarField_T, VectorField_T, VectorField_T,
+            KernelFieldInterpolator_T<InterpolationKernel_T>,
+            KernelDistributor_T<DistributionKernel_T>>;
+
+    using TurbineOutput_T = output::TurbineOutput<
+            FlagField_T, ScalarField_T, VectorField_T, SecondOrderTensorField_T, ThirdOrderTensorField_T,
+            PdfField_T, Stencil_T, StorageSpecification_T::zeroCenteredPDFs, StorageSpecification_T::compressible
+    >;
+
+    template<typename Type_T>
+    using GPUField_T = walberla::gpu::GPUField<Type_T>;
+
+    //******************************************************************************************************************
+    /*! Wake refinement criterion for the adaptive phase.
+     *
+     *  The initial (static) refinement only refines the turbine blocks. During the simulation this
+     *  criterion additionally refines the developing wake: blocks inside the wake corridor (the
+     *  turbine AABBs extruded in downstream direction) are refined up to maxLevel where the velocity
+     *  gradient exceeds upperLimit and coarsened again where it falls below lowerLimit. Blocks
+     *  intersecting a turbine AABB always stay on the finest level; blocks outside the corridor are
+     *  coarsened back towards the coarsest level.
+     *
+     *  The criterion evaluates the CPU velocity field, which is staged from the device before every
+     *  blockforest refresh.
+     */
+    //******************************************************************************************************************
+    class WakeRefinementCriterion {
+
+    public:
+
+        WakeRefinementCriterion( const walberla::ConstBlockDataID & velocityFieldID, WindFarm_T * farm,
+                                 const std::vector<real_t> & turbineDiameters,
+                                 const real_t lowerLimit, const real_t upperLimit, const uint_t maxLevel,
+                                 const uint_t flowAxis, const bool flowPositive, const real_t corridorScale )
+        : velocityFieldID_(velocityFieldID), farm_(farm), turbineDiameters_(turbineDiameters),
+          lowerLimitSq_(lowerLimit * lowerLimit), upperLimitSq_(upperLimit * upperLimit),
+          maxLevel_(maxLevel), flowAxis_(flowAxis), flowPositive_(flowPositive), corridorScale_(corridorScale) {}
+
+        void operator()( std::vector< std::pair< const walberla::Block *, uint_t > > & minTargetLevels,
+                         std::vector< const walberla::Block * > &, const walberla::BlockForest & forest ) {
+
+            const auto & turbineAABBs = farm_->getTurbineAABBs();
+            const auto & domainAABB = forest.getDomain();
+
+            // Tight rotor boxes (hub position +- rotor radius + margin) and their wake corridors
+            // (the rotor box scaled by corridorScale and extruded downstream to the domain border).
+            // The farm's own turbine AABBs are not used here: they conservatively include the tower
+            // height in every direction (as needed for the force communication), which would keep far
+            // too many blocks on the finest level.
+            std::vector<walberla::AABB> turbineBoxes;
+            std::vector<walberla::AABB> corridors;
+            for( uint_t i = 0; i < turbineAABBs.size(); ++i ) {
+
+                const auto & min = turbineAABBs[i].minCorner();
+                const auto & max = turbineAABBs[i].maxCorner();
+                // the farm AABB is centered at the hub position
+                const walberla::Vector3<real_t> hub( real_t(0.5) * real_t(min[0] + max[0]),
+                                                     real_t(0.5) * real_t(min[1] + max[1]),
+                                                     real_t(0.5) * real_t(min[2] + max[2]) );
+
+                const real_t diameter = turbineDiameters_[std::min(i, uint_t(turbineDiameters_.size()) - uint_t(1))];
+                const real_t halfWidth = real_t(0.5) * diameter + real_t(3);   // rotor radius + spreading-kernel margin
+
+                auto turbineBox = walberla::AABB( hub[0] - halfWidth, hub[1] - halfWidth, hub[2] - halfWidth,
+                                                  hub[0] + halfWidth, hub[1] + halfWidth, hub[2] + halfWidth );
+                turbineBoxes.push_back(turbineBox);
+
+                auto corridor = turbineBox;
+                corridor.scale(corridorScale_);
+                auto corridorMin = corridor.minCorner();
+                auto corridorMax = corridor.maxCorner();
+                if( flowPositive_ ) corridorMax[flowAxis_] = domainAABB.max(flowAxis_);
+                else                corridorMin[flowAxis_] = domainAABB.min(flowAxis_);
+                corridors.emplace_back(corridorMin, corridorMax);
+            }
+
+            for( auto & blockAndLevel : minTargetLevels ) {
+
+                const auto * block = blockAndLevel.first;
+                const uint_t currentLevel = block->getLevel();
+
+                // turbine blocks always stay on the finest level
+                bool turbineBlock = false;
+                for( const auto & box : turbineBoxes ) {
+                    if( box.intersects(block->getAABB()) ) { turbineBlock = true; break; }
+                }
+                if( turbineBlock ) {
+                    blockAndLevel.second = maxLevel_;
+                    continue;
+                }
+
+                bool inWake = false;
+                for( const auto & corridor : corridors ) {
+                    if( corridor.intersects(block->getAABB()) ) { inWake = true; break; }
+                }
+
+                uint_t targetLevel = currentLevel;
+
+                if( !inWake ) {
+                    // outside the wake corridor: coarsen back towards the coarsest level
+                    if( currentLevel > uint_t(0) )
+                        targetLevel = currentLevel - uint_t(1);
+                } else {
+                    // Inside the wake corridor: refine/coarsen based on the velocity gradient.
+                    // The gradient is only evaluated in the part of the block that lies inside the
+                    // corridor: blocks may span the whole domain height, and the ground shear of the
+                    // wall boundary layer below the corridor must not trigger wake refinement.
+                    const auto * u = block->getData<VectorField_T>(velocityFieldID_);
+                    const auto & blockAABB = block->getAABB();
+
+                    const cell_idx_t sizes[3] = { cell_idx_t(u->xSize()), cell_idx_t(u->ySize()), cell_idx_t(u->zSize()) };
+                    const real_t cellSize[3] = { real_t(blockAABB.xSize()) / real_t(sizes[0]),
+                                                 real_t(blockAABB.ySize()) / real_t(sizes[1]),
+                                                 real_t(blockAABB.zSize()) / real_t(sizes[2]) };
+
+                    real_t maxGradientSq = real_t(0);
+
+                    for( const auto & corridor : corridors ) {
+
+                        if( !corridor.intersects(blockAABB) )
+                            continue;
+
+                        // block-local cell range of the corridor overlap, restricted to the interior
+                        // cells reachable by the central differences
+                        cell_idx_t lo[3], hi[3];
+                        for( uint_t d = 0; d < uint_t(3); ++d ) {
+                            const real_t overlapMin = std::max(real_t(corridor.min(d)), real_t(blockAABB.min(d)));
+                            const real_t overlapMax = std::min(real_t(corridor.max(d)), real_t(blockAABB.max(d)));
+                            lo[d] = std::max(cell_idx_t(1),
+                                             cell_idx_t(std::floor((overlapMin - real_t(blockAABB.min(d))) / cellSize[d])));
+                            hi[d] = std::min(sizes[d] - cell_idx_t(2),
+                                             cell_idx_t(std::ceil((overlapMax - real_t(blockAABB.min(d))) / cellSize[d])) - cell_idx_t(1));
+                        }
+
+                        for( cell_idx_t z = lo[2]; z <= hi[2]; ++z ) {
+                            for( cell_idx_t y = lo[1]; y <= hi[1]; ++y ) {
+                                for( cell_idx_t x = lo[0]; x <= hi[0]; ++x ) {
+                                    for( uint_t d = 0; d < uint_t(3); ++d ) {
+                                        const real_t dx = u->get(x + cell_idx_t(1), y, z, d) - u->get(x - cell_idx_t(1), y, z, d);
+                                        const real_t dy = u->get(x, y + cell_idx_t(1), z, d) - u->get(x, y - cell_idx_t(1), z, d);
+                                        const real_t dz = u->get(x, y, z + cell_idx_t(1), d) - u->get(x, y, z - cell_idx_t(1), d);
+                                        maxGradientSq = std::max(maxGradientSq, real_t(0.25) * (dx * dx + dy * dy + dz * dz));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if( maxGradientSq > upperLimitSq_ && currentLevel < maxLevel_ )
+                        targetLevel = currentLevel + uint_t(1);
+                    else if( maxGradientSq < lowerLimitSq_ && currentLevel > uint_t(0) )
+                        targetLevel = currentLevel - uint_t(1);
+                }
+
+                blockAndLevel.second = targetLevel;
+            }
+        }
+
+    private:
+
+        walberla::ConstBlockDataID velocityFieldID_;
+        WindFarm_T * farm_;
+        std::vector<real_t> turbineDiameters_;
+        real_t lowerLimitSq_;
+        real_t upperLimitSq_;
+        uint_t maxLevel_;
+        uint_t flowAxis_;
+        bool flowPositive_;
+        real_t corridorScale_;
+
+    };
+
+    int main(int argc, char** argv) {
+
+        walberla::Environment walberlaEnv(argc, argv);
+        walberla::gpu::selectDeviceBasedOnMpiRank();
+
+        walberla::logging::Logging::instance()->setLogLevel(walberla::logging::Logging::INFO);
+
+        /// general simulation parameters
+        auto globalConfig = walberlaEnv.config();
+        auto parameters = globalConfig->getOneBlock("Parameters");
+
+        uint_t timesteps = parameters.getParameter<uint_t>("timesteps", uint_t(10)); ++timesteps;
+        const real_t remainingTimeLoggerFrequency = parameters.getParameter<real_t>("remainingTimeLoggerFrequency", real_t(3.0)); // in seconds
+
+        const real_t length_SI = parameters.getParameter<real_t>("length_SI");
+        const real_t length_LU = parameters.getParameter<real_t>("length_LU");
+        const real_t velocity_SI = parameters.getParameter<real_t>("velocity_SI");
+        const real_t velocity_LU = parameters.getParameter<real_t>("velocity_LU");
+        const real_t viscosity_SI = parameters.getParameter<real_t>("viscosity_SI");
+        const real_t density_SI = parameters.getParameter<real_t>("density_SI");
+
+        Conversion::calculateConversionFactors(length_SI, length_LU, velocity_SI, velocity_LU, density_SI);
+        Conversion::print();
+
+//        projectors::GaussianFunction5<>::setSigma(real_t(7.07106781));
+
+        /// parameter conversion
+        real_t viscosity_LU = (viscosity_SI / density_SI) * Conversion::C_t() / Conversion::C_l() / Conversion::C_l();
+
+        WALBERLA_CHECK_GREATER(viscosity_LU, real_t(0.0), "Negative LU velocity - Did you calculate the conversion factors?")
+
+        // calculate omega on coarsest level
+        const real_t omega = walberla::lbm::collision_model::omegaFromViscosity(viscosity_LU);
+        WALBERLA_LOG_INFO_ON_ROOT("omega = " << omega)
+
+        /// TURBINE
+
+        auto windFarmConfig = globalConfig->getBlock("WindFarm");
+        const std::string turbineOutputDirectory = windFarmConfig.getParameter<std::string>("outputFolder", "");
+        const uint_t forceOutputStart = windFarmConfig.getParameter<uint_t>("startingTimeStepForces", 0);
+        const uint_t forceOutputFrequency = windFarmConfig.getParameter<uint_t>("frequencyOutputForces", 1);
+
+        WindFarm_T farm(turbineOutputDirectory, windFarmConfig);
+        farm.createGeometry();
+        farm.calculateTurbineAABBs();
+
+        /// BLOCKFOREST
+
+        WALBERLA_LOG_INFO_ON_ROOT("Creating blockforest...")
+
+        auto boundariesConfig = globalConfig->getOneBlock( "Boundaries" );
+        domain::BoundarySetup boundarySetup(boundariesConfig);
+
+        if (boundarySetup.inflowType() == InflowSetup::ShiftedPeriodic && codegen::KernelInfo::inplace) {
+            WALBERLA_ABORT("For the moment, shifted periodicity is not compatible with in-place streaming patterns. "
+                     "Please change either inflow/outflow type or streaming pattern.")
+        }
+
+        domain::DomainSetup domainSetup ( globalConfig, boundarySetup.periodicity() );
+        
+        WALBERLA_ASSERT(!domainSetup.snapshotHandler_->loadSnapshot, "Restart is currently not supported for non-uniform grids.")
+
+        refinement::StaticRefinementHandler<WindFarm_T> staticRefinementHandler{ globalConfig->getOneBlock("DomainSetup"), &farm, boundarySetup.environmentSetup() };
+        auto blocks = domainSetup.createStructuredBlockForest(staticRefinementHandler, fieldGhostLayers);
+
+        farm.setBlockForest(blocks);
+        farm.initialiseForceAndControlModel();
+
+        /// ADAPTIVE MESH REFINEMENT (optional)
+        // The initial (static) refinement only refines the turbine blocks. If
+        // Refinement.adaptiveFrequency > 0, the block levels are re-evaluated every
+        // adaptiveFrequency (coarse) time steps via blockforest->refresh(), using the
+        // WakeRefinementCriterion: the wake downstream of the turbine is refined dynamically
+        // wherever the velocity gradient is strong and coarsened again in calm regions.
+        uint_t adaptiveFrequency = 0;
+        real_t wakeLowerLimit{}, wakeUpperLimit{}, wakeCorridorScale{};
+        {
+            const auto domainConfig = globalConfig->getOneBlock("DomainSetup");
+            if( domainConfig.getNumBlocks("Refinement") ) {
+                const auto refinementConfig = domainConfig.getOneBlock("Refinement");
+                adaptiveFrequency = refinementConfig.getParameter<uint_t>("adaptiveFrequency", uint_t(0));
+                wakeLowerLimit = refinementConfig.getParameter<real_t>("wakeLowerLimit", real_t(1e-3));
+                wakeUpperLimit = refinementConfig.getParameter<real_t>("wakeUpperLimit", real_t(3e-3));
+                wakeCorridorScale = refinementConfig.getParameter<real_t>("wakeCorridorScale", real_t(1.5));
+            }
+        }
+        const bool adaptiveRefinement = (adaptiveFrequency > 0) && (domainSetup.numLevels_ > 0);
+
+        auto forest = blocks->getBlockForestPointer();
+        if( adaptiveRefinement ) {
+            WALBERLA_LOG_INFO_ON_ROOT("Adaptive wake refinement enabled (every " << adaptiveFrequency << " time steps, "
+                                      << "gradient limits [" << wakeLowerLimit << ", " << wakeUpperLimit << "])")
+
+            forest->recalculateBlockLevelsInRefresh(true);
+            forest->alwaysRebalanceInRefresh(true);
+            forest->allowRefreshChangingDepth(true);
+            forest->allowMultipleRefreshCycles(true);
+            forest->reevaluateMinTargetLevelsAfterForcedRefinement(true);
+            forest->checkForEarlyOutInRefresh(true);
+            forest->checkForLateOutInRefresh(true);
+            forest->setRefreshPhantomBlockMigrationPreparationFunction(
+                    walberla::blockforest::DynamicCurveBalance<walberla::blockforest::NoPhantomData>(true, true, false));
+        }
+
+        /// FIELDS
+
+        WALBERLA_LOG_INFO_ON_ROOT("Creating fields...")
+
+        //layout - DO NOT CHANGE
+        auto layout = codegen::KernelInfo::layout;
+        const StorageSpecification_T storageSpec{};
+
+        std::map<output::Fields::Types, BlockDataID> fieldMap {};
+        uint_t initialWelfordCounter = 0;
+
+        auto allocator = std::make_shared< walberla::gpu::HostFieldAllocator<real_t> >(); // use pinned memory allocator for faster CPU-GPU memory transfers
+        BlockDataID forceFieldCpuID;
+        BlockDataID meanVelocityFieldCpuID;
+        BlockDataID pdfFieldCpuID;
+        BlockDataID sumOfCubesFieldCpuID;
+        BlockDataID sumOfSquaresFieldCpuID;
+
+        if(domainSetup.snapshotHandler_->loadSnapshot) {
+
+        	auto & ssh = domainSetup.snapshotHandler_;
+        	
+        	auto vectorFieldDataHandling = std::make_shared<field::FlattenedFieldHandling<VectorField_T>> (blocks, fieldGhostLayers, layout, allocator);
+        	const auto forceFileName = std::string(std::filesystem::path(ssh->baseFolder) / std::filesystem::path(ssh->forceFile).c_str());
+        	
+        	forceFieldCpuID = blocks->loadBlockData(forceFileName, vectorFieldDataHandling, "force field CPU");
+        	
+        	auto pdfFieldDataHandling = std::make_shared< walberla::lbm_generated::internal::PdfFieldHandling< StorageSpecification_T > >( blocks, storageSpec, fieldGhostLayers, layout, allocator );
+        	
+        	const auto pdfFileName = std::string(std::filesystem::path(ssh->baseFolder) / std::filesystem::path(ssh->pdfFile).c_str());
+        	pdfFieldCpuID = blocks->loadBlockData(pdfFileName, pdfFieldDataHandling, "pdf field CPU");
+        	
+
+        	if(!ssh->meanVelFile.empty()) {
+        		const auto meanVelFileName = std::string(std::filesystem::path(ssh->baseFolder) / std::filesystem::path(ssh->meanVelFile).c_str());
+        		initialWelfordCounter = ssh->welfordCounter;
+
+        		meanVelocityFieldCpuID = blocks->loadBlockData(meanVelFileName, vectorFieldDataHandling, "mean velocity field CPU");
+
+        		if(!ssh->sosFile.empty()) {
+        			auto secondOrderTensorFieldDataHandling = std::make_shared<field::FlattenedFieldHandling<SecondOrderTensorField_T>> (blocks, fieldGhostLayers, layout, allocator);
+        			const auto sosFileName = std::string(std::filesystem::path(ssh->baseFolder) / std::filesystem::path(ssh->sosFile).c_str());
+        			sumOfSquaresFieldCpuID = blocks->loadBlockData(sosFileName, secondOrderTensorFieldDataHandling, "sum of squares field");
+        		}
+        		if(!ssh->socFile.empty()) {
+        			auto thirdOrderTensorFieldDataHandling = std::make_shared<field::FlattenedFieldHandling<ThirdOrderTensorField_T>> (blocks, fieldGhostLayers, layout, allocator);
+        			const auto socFileName = std::string(std::filesystem::path(ssh->baseFolder) / std::filesystem::path(ssh->socFile).c_str());
+        			sumOfCubesFieldCpuID = blocks->loadBlockData(socFileName, thirdOrderTensorFieldDataHandling, "sum of cubes field CPU");
+        		}
+        	}
+        } else {
+        	forceFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "force field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        	meanVelocityFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "mean velocity field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        	pdfFieldCpuID = walberla::lbm_generated::addPdfFieldToStorage(blocks, "pdf field CPU", storageSpec, fieldGhostLayers, layout, walberla::Set<walberla::SUID>::emptySet(), walberla::Set<walberla::SUID>::emptySet(), allocator);
+        	sumOfCubesFieldCpuID = walberla::field::addToStorage<ThirdOrderTensorField_T>(blocks, "sum of cubes field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        	sumOfSquaresFieldCpuID = walberla::field::addToStorage<SecondOrderTensorField_T>(blocks, "sum of squares field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        }
+
+        BlockDataID densityFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "density field CPU", real_t(1), layout, fieldGhostLayers, allocator);
+        BlockDataID eddyViscosityFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "eddy viscosity field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID flagFieldID = walberla::field::addFlagFieldToStorage<FlagField_T>(blocks, "flag field", fieldGhostLayers);
+        BlockDataID meanEddyViscosityFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "mean eddy viscosity field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID meanStrainRateFieldCpuID = walberla::field::addToStorage<SecondOrderTensorField_T>(blocks, "mean strain rate field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID omegaFieldCpuID = walberla::field::addToStorage<ScalarField_T>(blocks, "omega field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID strainRateFieldCpuID = walberla::field::addToStorage<SecondOrderTensorField_T>(blocks, "strain rate field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+        BlockDataID velocityFieldCpuID = walberla::field::addToStorage<VectorField_T>(blocks, "velocity field CPU", real_t(0), layout, fieldGhostLayers, allocator);
+
+
+        fieldMap[output::Fields::DENSITY] = densityFieldCpuID;
+        fieldMap[output::Fields::EDDY_VISCOSITY] = eddyViscosityFieldCpuID;
+        fieldMap[output::Fields::FLAG] = flagFieldID;
+        fieldMap[output::Fields::FORCE] = forceFieldCpuID;
+        fieldMap[output::Fields::MEAN_EDDY_VISCOSITY] = meanEddyViscosityFieldCpuID;
+        fieldMap[output::Fields::MEAN_STRAIN_RATE] = meanStrainRateFieldCpuID;
+        fieldMap[output::Fields::MEAN_VELOCITY] = meanVelocityFieldCpuID;
+        fieldMap[output::Fields::OMEGA] = omegaFieldCpuID;
+        fieldMap[output::Fields::PDF] = pdfFieldCpuID;
+        fieldMap[output::Fields::STRAIN_RATE] = strainRateFieldCpuID;
+        fieldMap[output::Fields::SUM_OF_CUBES] = sumOfCubesFieldCpuID;
+        fieldMap[output::Fields::SUM_OF_SQUARES] = sumOfSquaresFieldCpuID;
+        fieldMap[output::Fields::VELOCITY] = velocityFieldCpuID;
+
+        /// ABL calculations
+
+        auto initParams = globalConfig->getOneBlock("Initialisation");
+        const auto initType = domain::DomainInitialisation::toType(initParams.getParameter<std::string>("type"));
+        const Vector3<real_t> initialVelocity = initParams.getParameter<Vector3<real_t>>("initialVelocity");
+
+        const real_t kappa = parameters.getParameter<real_t>("kappa", real_t(0.42));
+        const real_t B = parameters.getParameter<real_t>("B", real_t(5.5));
+        const real_t roughnessLengthRatio = parameters.getParameter<real_t>("roughnessLengthRatio", real_t(1e-4));
+        const real_t referenceHeight = parameters.getParameter<real_t>("referenceHeight_LU", real_t(-1));
+        const uint32_t samplingHeight = parameters.getParameter<uint32_t>("samplingHeight_LU");
+        const real_t velocityFilterWidth = parameters.getParameter<real_t>("velocityFilterWidth");
+        const real_t roughnessLength = roughnessLengthRatio * referenceHeight;
+
+        const uint_t welfordInterval = walberlaEnv.config()->getOneBlock("Output").getParameter<uint_t>("welfordInterval", uint_t(0));
+        // uTau from MOST
+        const real_t uTau = kappa * initialVelocity[0] / std::log(real_t(1) / roughnessLengthRatio);
+
+        /// DOMAIN INITIALISATION
+
+        WALBERLA_LOG_INFO_ON_ROOT("Initialise domain...")
+        if(!domainSetup.snapshotHandler_->loadSnapshot) {
+        			
+            const real_t flowDirection = atan(initialVelocity[1] / initialVelocity[0]);
+            std::unique_ptr<domain::DomainInitialisation> initialiser{};
+            if (initType == domain::DomainInitialisation::UNIFORM) {
+                initialiser = std::make_unique<domain::UniformInitialisation>(blocks, initialVelocity);
+            } else if (initType == domain::DomainInitialisation::ASMUTH) {
+                initialiser = std::make_unique<domain::AsmuthInitialisation>(blocks, flowDirection, uTau, roughnessLength, kappa, B,
+                                                                             viscosity_LU, domainSetup.domainSize_, true);
+            } else if (initType == domain::DomainInitialisation::LOG_LAW) {
+                // asmuth without perturbation velocities
+                initialiser = std::make_unique<domain::AsmuthInitialisation>(blocks, flowDirection, uTau, roughnessLength, kappa, B,
+                                                                             viscosity_LU, domainSetup.domainSize_, false);
+            }
+            using PdfSetter_T = walberla::pystencils::waLBerlaWind_PdfSetter;
+            PdfSetter_T setter(densityFieldCpuID, forceFieldCpuID, pdfFieldCpuID, velocityFieldCpuID);
+            initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(velocityFieldCpuID, setter);
+
+        	initialiser->setViaVelocityField<VectorField_T, PdfSetter_T>(meanVelocityFieldCpuID, setter);
+        } else {
+
+        	if(domainSetup.snapshotHandler_->meanVelFile.empty()) {
+        		WALBERLA_ABORT("Mean velocity not loaded from snapshot but also not initialised.")
+        	}
+
+        	// initialise velocity field from pfd field if snapshot
+        	walberla::pystencils::waLBerlaWind_MacroGetter getter(densityFieldCpuID, forceFieldCpuID, pdfFieldCpuID, velocityFieldCpuID);
+        	    for( auto & block : *blocks ) {
+                            getter(&block);
+                        }
+        }
+
+        WALBERLA_LOG_INFO_ON_ROOT("Add GPU fields...")
+
+        BlockDataID densityFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>( blocks, densityFieldCpuID, "density field GPU", true );
+        BlockDataID eddyViscosityFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>( blocks, eddyViscosityFieldCpuID, "eddy viscosity field GPU", true );
+        BlockDataID forceFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>( blocks, forceFieldCpuID, "force field GPU", true );
+        BlockDataID meanEddyViscosityFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>( blocks, meanEddyViscosityFieldCpuID, "mean eddy viscosity field GPU", true );
+        BlockDataID meanStrainRateFieldGpuID = walberla::gpu::addGPUFieldToStorage<SecondOrderTensorField_T>( blocks, meanStrainRateFieldCpuID, "mean strain rate field GPU", true );
+        BlockDataID meanVelocityFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>( blocks, meanVelocityFieldCpuID, "mean velocity field GPU", true );
+        BlockDataID omegaFieldGpuID = walberla::gpu::addGPUFieldToStorage<ScalarField_T>( blocks, omegaFieldCpuID, "omega field GPU", true );
+        BlockDataID pdfFieldGpuID = walberla::lbm_generated::addGPUPdfFieldToStorage<PdfField_T, StorageSpecification_T >(blocks, pdfFieldCpuID, storageSpec, "pdf field GPU");
+        BlockDataID strainRateFieldGpuID = walberla::gpu::addGPUFieldToStorage<SecondOrderTensorField_T>( blocks, strainRateFieldCpuID, "strain rate field GPU", true );
+        BlockDataID sumOfCubesFieldGpuID = walberla::gpu::addGPUFieldToStorage<ThirdOrderTensorField_T>( blocks, sumOfCubesFieldCpuID, "sum of cubes field GPU", true );
+        BlockDataID sumOfSquaresFieldGpuID = walberla::gpu::addGPUFieldToStorage<SecondOrderTensorField_T>( blocks, sumOfSquaresFieldCpuID, "sum of squares field GPU", true );
+        BlockDataID velocityFieldGpuID = walberla::gpu::addGPUFieldToStorage<VectorField_T>( blocks, velocityFieldCpuID, "velocity field GPU", true );
+        SweepCollection_T sweepCollection( blocks, densityFieldGpuID, eddyViscosityFieldGpuID, forceFieldGpuID, omegaFieldGpuID, 
+                                           pdfFieldGpuID, velocityFieldGpuID, omega );
+
+        // for (auto& block : *blocks) {
+        //     sweepCollection.initialise(&block);
+        //     sweepCollection.initialise(&block, fieldGhostLayers);
+        // }
+        WALBERLA_MPI_BARRIER()
+        WALBERLA_LOG_INFO_ON_ROOT("Initialisation done")
+
+        /// BOUNDARIES
+
+        WALBERLA_LOG_INFO_ON_ROOT("Setting up boundaries...")
+
+        boundarySetup.fillFlagFieldFromConfig<FlagField_T>(blocks, flagFieldID, FluidFlagUID,
+                                                           NoSlipFlagUID, WFBFlagUID, SymmetryFlagUID, UniformInflowFlagUID,
+                                                           LogLawInflowFlagUID, OutflowFlagUID);
+
+        if(boundarySetup.wallType() == WallSetup::WFB){
+            WALBERLA_CHECK(referenceHeight > real_t(0), "Reference height must be given in the parameter file for wall function boundary conditions.")
+            WALBERLA_CHECK(boundarySetup.environmentSetup() != EnvironmentSetup::Tunnel,
+                           "Wall-function bounce is currently not supported for the tunnel environment")
+            // WALBERLA_CHECK(samplingHeight >= uint_t(0), "Sampling height for wall function boundary conditions must be a positive integer.")
+            WALBERLA_CHECK(samplingHeight < domainSetup.cellsPerBlock_[2], "Sampling height must be smaller than block height.")
+        }
+        
+
+        const auto& inflowVelocity = boundarySetup.inflowVelocity();
+        auto velocityInit = boundary::velocityInit(roughnessLength, kappa, uTau);
+        BoundaryCollection_T boundaryCollection( 
+        	blocks, flagFieldID, pdfFieldGpuID, FluidFlagUID, velocityFieldGpuID, 
+        	samplingHeight, velocityFilterWidth,  roughnessLengthRatio * referenceHeight,
+        	inflowVelocity[0], inflowVelocity[1], inflowVelocity[2],velocityFieldCpuID,  velocityInit,
+        	pdfFieldCpuID
+        );
+
+        const int periodicShiftValue = boundariesConfig.getParameter<int>("periodicShiftValue", int(real_t(0.33) * real_t(domainSetup.domainSize_[2])));
+        // walberla::gpu::ShiftedPeriodicityGPU<PdfGPUField_T> shiftedPeriodicity (blocks, pdfFieldGpuID, fieldGhostLayers, 0, 1, periodicShiftValue);
+
+        /// set IDs for farm
+        farm.setFieldIDs(densityFieldGpuID, velocityFieldGpuID, forceFieldGpuID);
+
+        /// field resetter
+        
+        walberla::pystencils::waLBerlaWind_SoSResetter welfordOutputSosResetter(sumOfSquaresFieldGpuID);
+
+        walberla::pystencils::waLBerlaWind_SoCResetter welfordOutputSocResetter(sumOfCubesFieldGpuID);
+
+        /// WELFORDOUTPUT
+        walberla::pystencils::waLBerlaWind_WelfordOutput welfordOutputSweep(
+        	meanVelocityFieldGpuID, sumOfCubesFieldGpuID, sumOfSquaresFieldGpuID, velocityFieldGpuID, 
+        	real_t(initialWelfordCounter));
+        /// WELFORDEDDYVISCOSITY
+        walberla::pystencils::waLBerlaWind_WelfordEddyViscosity welfordEddyViscositySweep(
+        	eddyViscosityFieldGpuID, meanEddyViscosityFieldGpuID, 
+        	real_t(initialWelfordCounter));
+        /// WELFORDSTRAINRATE
+        walberla::pystencils::waLBerlaWind_WelfordStrainRate welfordStrainRateSweep(
+        	meanStrainRateFieldGpuID, strainRateFieldGpuID, 
+        	real_t(initialWelfordCounter));
+
+        /// COMMUNICATION
+
+        WALBERLA_LOG_INFO_ON_ROOT("Set up communication...")
+
+        // create communication for fields
+        bool gpuEnabledMPI = parameters.getParameter<bool>( "gpuEnabledMPI", false );
+        if(walberla::mpi::MPIManager::instance()->numProcesses() == 1)
+            gpuEnabledMPI = false;
+
+        auto communication = std::make_shared<walberla::gpu::communication::NonUniformGPUScheme<CommunicationStencil_T>>(blocks, gpuEnabledMPI);
+        auto pdfPackInfo = walberla::lbm_generated::setupNonuniformGPUPdfCommunication<PdfGPUField_T>(blocks, pdfFieldGpuID);
+        communication->addPackInfo( pdfPackInfo );
+        auto densityPackInfo = std::make_shared<walberla::GeneratedNonUniformGPUFieldPackInfo<GPUField_T<real_t>, walberla::pystencils::waLBerlaWind_DensityPackInfo>>(densityFieldGpuID);
+        communication->addPackInfo( densityPackInfo );
+        auto velocityPackInfo = std::make_shared<walberla::GeneratedNonUniformGPUFieldPackInfo<GPUField_T<real_t>, walberla::pystencils::waLBerlaWind_VelocityPackInfo>>(velocityFieldGpuID);
+        communication->addPackInfo( velocityPackInfo );
+
+        /// TIMELOOP
+
+        WALBERLA_LOG_INFO_ON_ROOT("Creating time loop...")
+
+        #ifdef NDEBUG
+        using TimingPolicy_T = walberla::timing::WcPolicy;
+#else
+        using TimingPolicy_T = walberla::timing::DeviceSynchronizePolicy;
+#endif
+        // create time loop
+        auto timeloop = walberla::timeloop::SweepTimeloop<TimingPolicy_T>(blocks->getBlockStorage(), timesteps);
+
+        farm.setTimeloop(&timeloop);
+
+        /// driving forces
+        walberla::wind::FlowDriverCollection flowDriver(blocks, &timeloop, globalConfig, domainSetup, forceFieldGpuID, velocityFieldGpuID, fieldGhostLayers);
+        for(auto & block : *blocks) { flowDriver(&block); }
+
+        uint_t maxKernelWidth = 1;
+        if constexpr (std::is_same_v<WindFarm_T::Interpolator, KernelFieldInterpolator_T<InterpolationKernel_T>>) {
+            maxKernelWidth = std::max({maxKernelWidth, InterpolationKernel_T::xWidth, InterpolationKernel_T::yWidth, InterpolationKernel_T::zWidth});
+        }
+        if constexpr (std::is_same_v<WindFarm_T::Distributor, KernelDistributor_T<DistributionKernel_T >>) {
+            maxKernelWidth = std::max({maxKernelWidth, DistributionKernel_T::xWidth, DistributionKernel_T::yWidth, DistributionKernel_T::zWidth});
+        }
+
+        walberla::Config::Blocks turbineBlocks{};
+        windFarmConfig.getBlocks(turbineBlocks);
+        auto numTurbines = turbineBlocks.size();
+        uint_t diameter = 0;
+        std::vector<real_t> turbineDiameters;
+        //TODO will we ever have different models during the simulation ?
+        for (auto & turbineConfig : turbineBlocks) {
+            const std::string aeroModel = turbineConfig.getParameter<std::string>( "aeroModel" );
+            if(aeroModel == "rotorDisk") {
+                diameter = math::max(diameter, turbineConfig.getParameter<uint_t>("diameter_LU"));
+            }
+            turbineDiameters.push_back(turbineConfig.getParameter<real_t>("diameter_LU"));
+        }
+
+        
+
+        // add LBM sweep and communication to time loop
+        // output
+        TurbineOutput_T turbineOutput{
+                blocks, &timeloop,
+                globalConfig->getOneBlock("Output"), FluidFlagUID,
+                fieldMap
+        };
+
+        walberla::pystencils::waLBerlaWind_StrainRateWriter strainRateWriter(forceFieldGpuID, omegaFieldGpuID, pdfFieldGpuID, strainRateFieldGpuID);
+
+        turbineOutput.addMacroscopicFieldCalculator( [&]() {
+        for( auto & block : *blocks ) {
+            strainRateWriter(&block);
+        }});
+        turbineOutput.addMacroscopicFieldCalculator( [&]() {
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>( blocks, densityFieldCpuID, densityFieldGpuID );
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>( blocks, velocityFieldCpuID, velocityFieldGpuID );
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>( blocks, forceFieldCpuID, forceFieldGpuID );
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>( blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID );
+            walberla::gpu::fieldCpy<ThirdOrderTensorField_T, GPUField_T<real_t>>( blocks, sumOfCubesFieldCpuID, sumOfCubesFieldGpuID );
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>( blocks, eddyViscosityFieldCpuID, eddyViscosityFieldGpuID );
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>( blocks, strainRateFieldCpuID, strainRateFieldGpuID );
+
+            gpuDeviceSynchronize();
+        });
+
+        
+
+        auto welfordOutputLambda = [&welfordOutputSweep](walberla::IBlock * block) {
+            welfordOutputSweep(block);
+        };
+        auto welfordEddyViscosityLambda = [&welfordEddyViscositySweep](walberla::IBlock * block) {
+            welfordEddyViscositySweep(block);
+        };
+        auto welfordStrainRateLambda = [&welfordStrainRateSweep](walberla::IBlock * block) {
+            welfordStrainRateSweep(block);
+        };
+
+        walberla::lbm_generated::BasicRecursiveTimeStepGPU<PdfGPUField_T, SweepCollection_T, BoundaryCollection_T, walberla::timeloop::SweepTimeloop<TimingPolicy_T>> recursiveTimestep (
+        	blocks, pdfFieldGpuID, sweepCollection, boundaryCollection, communication, pdfPackInfo );
+
+        recursiveTimestep.addPostCollisionFunction([&](uint_t level) { if(level!=0) return; turbineOutput.write(); }, "VTK output");
+        recursiveTimestep.addPostCollisionFunction( [&](uint_t){
+                          if ((domainSetup.snapshotHandler_->storeSnapshot) && (timeloop.getCurrentTimeStep() % domainSetup.snapshotHandler_->snapshotFrequency == 0) && (timeloop.getCurrentTimeStep() > 0)) {
+                             walberla::gpu::fieldCpy<PdfField_T, GPUField_T<real_t>>( blocks, pdfFieldCpuID, pdfFieldGpuID );
+                             walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>( blocks, forceFieldCpuID, forceFieldGpuID );
+                             walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>( blocks, meanVelocityFieldCpuID, meanVelocityFieldGpuID );
+                             walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>( blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID );
+                             walberla::gpu::fieldCpy<ThirdOrderTensorField_T, GPUField_T<real_t>>( blocks, sumOfCubesFieldCpuID, sumOfCubesFieldGpuID );
+                             gpuDeviceSynchronize();
+                             domainSetup.snapshotHandler_->createSnapshot(timeloop.getCurrentTimeStep(), blocks, pdfFieldCpuID, forceFieldCpuID,
+                                                                          uint_t(welfordOutputSweep.getCounter()), meanVelocityFieldCpuID, sumOfSquaresFieldCpuID, sumOfCubesFieldCpuID);
+                          }
+                          }, "Snapshot creation");
+        	recursiveTimestep.addPostCollisionFunction([&](uint_t){
+                           	if(welfordInterval && (uint_t(welfordOutputSweep.getCounter()) % welfordInterval == 0)){
+                           		welfordOutputSweep.setCounter(real_t(1));
+                           		for ( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt ) {
+                           			auto dst = blockIt->getData<GPUField_T<real_t>>( meanVelocityFieldGpuID );
+                           			const auto src = blockIt->getData<GPUField_T<real_t>>( velocityFieldGpuID );
+                           			gpu::fieldCopy( dst, src );
+                           			welfordOutputSosResetter(blockIt.get());
+                           			welfordOutputSocResetter(blockIt.get());
+                           		}
+                           	} else {
+                           		welfordOutputSweep.setCounter(real_t(welfordOutputSweep.getCounter() + 1));
+                           	}
+                           }, "Welford Output Sweep");
+        	recursiveTimestep.addPostCollisionFunction([&](uint_t level) {
+        std::vector<walberla::Block* > blocksOnLevel;
+        blocks->getBlocks(blocksOnLevel, level);
+        for (auto block: blocksOnLevel) {
+        	welfordOutputLambda(block);
+        }}, "Welford Output Sweep");
+
+        	recursiveTimestep.addPostCollisionFunction([&](uint_t){
+                           	if(welfordInterval && (uint_t(welfordEddyViscositySweep.getCounter()) % welfordInterval == 0)){
+                           		welfordEddyViscositySweep.setCounter(real_t(1));
+                           		for ( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt ) {
+                           			auto dst = blockIt->getData<GPUField_T<real_t>>( meanEddyViscosityFieldGpuID );
+                           			const auto src = blockIt->getData<GPUField_T<real_t>>( eddyViscosityFieldGpuID );
+                           			gpu::fieldCopy( dst, src );
+                           		}
+                           	} else {
+                           		welfordEddyViscositySweep.setCounter(real_t(welfordEddyViscositySweep.getCounter() + 1));
+                           	}
+                           }, "Welford Eddy Viscosity Sweep");
+        	recursiveTimestep.addPostCollisionFunction([&](uint_t level) {
+        std::vector<walberla::Block* > blocksOnLevel;
+        blocks->getBlocks(blocksOnLevel, level);
+        for (auto block: blocksOnLevel) {
+        	welfordEddyViscosityLambda(block);
+        }}, "Welford Eddy Viscosity Sweep");
+
+        	recursiveTimestep.addPostCollisionFunction([&](uint_t){
+                           	if(welfordInterval && (uint_t(welfordStrainRateSweep.getCounter()) % welfordInterval == 0)){
+                           		welfordStrainRateSweep.setCounter(real_t(1));
+                           		for ( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt ) {
+                           			auto dst = blockIt->getData<GPUField_T<real_t>>( meanStrainRateFieldGpuID );
+                           			const auto src = blockIt->getData<GPUField_T<real_t>>( strainRateFieldGpuID );
+                           			gpu::fieldCopy( dst, src );
+                           		}
+                           	} else {
+                           		welfordStrainRateSweep.setCounter(real_t(welfordStrainRateSweep.getCounter() + 1));
+                           	}
+                           }, "Welford Strain Rate Sweep");
+        	recursiveTimestep.addPostCollisionFunction([&](uint_t level) {
+        std::vector<walberla::Block* > blocksOnLevel;
+        blocks->getBlocks(blocksOnLevel, level);
+        for (auto block: blocksOnLevel) {
+        	welfordStrainRateLambda(block);
+        }}, "Welford Strain Rate Sweep");
+
+        recursiveTimestep.addPostCollisionFunction([&](uint_t) { farm.callback(Component::Function::UPDATE_DISCRETISATION); }, "Rotation");
+        recursiveTimestep.addPostCollisionFunction([&](uint_t level) {
+        std::vector<walberla::Block* > blocksOnLevel;
+        blocks->getBlocks(blocksOnLevel, level);
+        for (auto block: blocksOnLevel) {
+        	farm.evaluateDensityAndVelocity(block);
+        }}, "Evaluate density and velocity");
+
+        recursiveTimestep.addPostCollisionFunction( [&](uint_t){farm.syncNextNeighbour(mpi::SYNC_MACRO, 1, false);}, "Communicate macroscopic turbine data");
+        recursiveTimestep.addPostCollisionFunction([&](uint_t) {farm.applyControl();}, "Apply Control");
+        recursiveTimestep.addPostCollisionFunction([&](uint_t level) {
+        std::vector<walberla::Block* > blocksOnLevel;
+        blocks->getBlocks(blocksOnLevel, level);
+        for (auto block: blocksOnLevel) {
+        	flowDriver(block);
+        }}, "Setting driving force");
+
+        recursiveTimestep.addPostCollisionFunction([&](uint_t) { farm.callback( Component::Function::CALCULATE_FORCES ); }, "Calculate forces");
+        recursiveTimestep.addPostCollisionFunction([&](uint_t){farm.syncNextNeighbour(mpi::SYNC_FORCE, maxKernelWidth+uint_t(real_t(diameter)/real_t(2.0)), false);}, "Communicate force data");
+        recursiveTimestep.addPostCollisionFunction([&](uint_t level) {
+        std::vector<walberla::Block* > blocksOnLevel;
+        blocks->getBlocks(blocksOnLevel, level);
+        for (auto block: blocksOnLevel) {
+        	farm.spreadForces(block);
+        }}, "Spread forces");
+
+        recursiveTimestep.addPostCollisionFunction([&](uint_t) { farm.callback(Component::Function::RESET_COMMUNICATION_DATA); }, "Reset communication data");
+
+        recursiveTimestep.addRefinementToTimeLoop( timeloop );
+
+        /// ADAPTIVE REFINEMENT STEP
+        // domain decomposition output, written after every adaptive refinement step (the periodic
+        // writeDomainDecomposition output of TurbineOutput only samples at the VTK write frequency
+        // and would miss the block-structure changes)
+        std::shared_ptr<walberla::vtk::VTKOutput> amrDecompositionOutput{};
+        if( adaptiveRefinement ) {
+            std::string vtkBaseFolder{"vtk_out"};
+            const auto outputConfig = globalConfig->getOneBlock("Output");
+            if( outputConfig.getNumBlocks("VTK") )
+                vtkBaseFolder = outputConfig.getOneBlock("VTK").getParameter<std::string>("baseFolder", vtkBaseFolder);
+
+            amrDecompositionOutput = walberla::vtk::createVTKOutput_DomainDecomposition(
+                    *blocks, "domain_decomposition_amr", uint_t(1), vtkBaseFolder, "simulation_step",
+                    false, true, true, false );
+            // initial decomposition (static refinement of the turbine blocks)
+            amrDecompositionOutput->write();
+        }
+
+        if( adaptiveRefinement ) {
+            // wake corridor extends downstream along the dominant inflow direction
+            const uint_t wakeFlowAxis = (std::abs(initialVelocity[0]) >= std::abs(initialVelocity[1])) ? uint_t(0) : uint_t(1);
+            const bool wakeFlowPositive = initialVelocity[wakeFlowAxis] >= real_t(0);
+
+            WakeRefinementCriterion wakeRefinement( velocityFieldCpuID, &farm, turbineDiameters,
+                                                    wakeLowerLimit, wakeUpperLimit, domainSetup.numLevels_,
+                                                    wakeFlowAxis, wakeFlowPositive, wakeCorridorScale );
+            forest->setRefreshMinTargetLevelDeterminationFunction(wakeRefinement);
+        }
+
+        // Re-evaluates the block levels and re-establishes all block-structure-dependent data.
+        // The GPU fields cannot be migrated by the blockforest, so the live device data is staged in
+        // the CPU mirror fields, refresh() migrates those across levels and processes, and the result
+        // is uploaded back to the (re-created) device fields.
+        auto adaptiveRefinementStep = [&]() {
+
+            // stage the live GPU data on the host
+            walberla::gpu::fieldCpy<PdfField_T, GPUField_T<real_t>>( blocks, pdfFieldCpuID, pdfFieldGpuID );
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>( blocks, densityFieldCpuID, densityFieldGpuID );
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>( blocks, eddyViscosityFieldCpuID, eddyViscosityFieldGpuID );
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>( blocks, meanEddyViscosityFieldCpuID, meanEddyViscosityFieldGpuID );
+            walberla::gpu::fieldCpy<ScalarField_T, GPUField_T<real_t>>( blocks, omegaFieldCpuID, omegaFieldGpuID );
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>( blocks, forceFieldCpuID, forceFieldGpuID );
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>( blocks, meanVelocityFieldCpuID, meanVelocityFieldGpuID );
+            walberla::gpu::fieldCpy<VectorField_T, GPUField_T<real_t>>( blocks, velocityFieldCpuID, velocityFieldGpuID );
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>( blocks, meanStrainRateFieldCpuID, meanStrainRateFieldGpuID );
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>( blocks, strainRateFieldCpuID, strainRateFieldGpuID );
+            walberla::gpu::fieldCpy<SecondOrderTensorField_T, GPUField_T<real_t>>( blocks, sumOfSquaresFieldCpuID, sumOfSquaresFieldGpuID );
+            walberla::gpu::fieldCpy<ThirdOrderTensorField_T, GPUField_T<real_t>>( blocks, sumOfCubesFieldCpuID, sumOfCubesFieldGpuID );
+            WALBERLA_GPU_CHECK(gpuDeviceSynchronize())
+
+            // re-evaluate the block levels and migrate the (CPU) block data
+            forest->refresh();
+
+            // re-establish everything that depends on the block structure
+            farm.setBlockForest(blocks);
+            farm.resetTurbineCommunication();
+            walberla::lbm_generated::recalculateNonuniformGPUCommData<StorageSpecification_T>(blocks, pdfPackInfo->commDataID_);
+
+            // the flag field of changed blocks is interpolated during the refresh -> rebuild it from
+            // the config and refill the boundary index vectors
+            boundarySetup.fillFlagFieldFromConfig<FlagField_T>(blocks, flagFieldID, FluidFlagUID,
+                                                               NoSlipFlagUID, WFBFlagUID, SymmetryFlagUID, UniformInflowFlagUID,
+                                                               LogLawInflowFlagUID, OutflowFlagUID);
+            boundaryCollection.waLBerlaWind_NoSlipObject->template fillFromFlagField<FlagField_T>(blocks, flagFieldID, NoSlipFlagUID, FluidFlagUID);
+            boundaryCollection.waLBerlaWind_FreeSlipObject->template fillFromFlagField<FlagField_T>(blocks, flagFieldID, SymmetryFlagUID, FluidFlagUID);
+            boundaryCollection.waLBerlaWind_WFBObject->template fillFromFlagField<FlagField_T>(blocks, flagFieldID, WFBFlagUID, FluidFlagUID);
+            boundaryCollection.waLBerlaWind_UniformUBBObject->template fillFromFlagField<FlagField_T>(blocks, flagFieldID, UniformInflowFlagUID, FluidFlagUID);
+            boundaryCollection.waLBerlaWind_LogLawUBBObject->template fillFromFlagField<FlagField_T>(blocks, flagFieldID, LogLawInflowFlagUID, FluidFlagUID);
+            boundaryCollection.waLBerlaWind_OutflowObject->template fillFromFlagField<FlagField_T>(blocks, flagFieldID, OutflowFlagUID, FluidFlagUID);
+
+            // upload the migrated data back to the device
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, PdfField_T>( blocks, pdfFieldGpuID, pdfFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, ScalarField_T>( blocks, densityFieldGpuID, densityFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, ScalarField_T>( blocks, eddyViscosityFieldGpuID, eddyViscosityFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, ScalarField_T>( blocks, meanEddyViscosityFieldGpuID, meanEddyViscosityFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, ScalarField_T>( blocks, omegaFieldGpuID, omegaFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, VectorField_T>( blocks, forceFieldGpuID, forceFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, VectorField_T>( blocks, meanVelocityFieldGpuID, meanVelocityFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, VectorField_T>( blocks, velocityFieldGpuID, velocityFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, SecondOrderTensorField_T>( blocks, meanStrainRateFieldGpuID, meanStrainRateFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, SecondOrderTensorField_T>( blocks, strainRateFieldGpuID, strainRateFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, SecondOrderTensorField_T>( blocks, sumOfSquaresFieldGpuID, sumOfSquaresFieldCpuID );
+            walberla::gpu::fieldCpy<GPUField_T<real_t>, ThirdOrderTensorField_T>( blocks, sumOfCubesFieldGpuID, sumOfCubesFieldCpuID );
+            WALBERLA_GPU_CHECK(gpuDeviceSynchronize())
+
+            // resize the per-level resources (GPU streams, timestep parity) of the recursive time step
+            recursiveTimestep.update();
+
+            // write the changed domain decomposition
+            if( amrDecompositionOutput )
+                amrDecompositionOutput->write();
+
+            WALBERLA_LOG_INFO_ON_ROOT("Adaptive refinement: depth " << blocks->getDepth() << ", "
+                                      << forest->getNumberOfBlocks() << " blocks on root process")
+        };
+
+        // LBM stability check
+        timeloop.addFuncAfterTimeStep( walberla::makeSharedFunctor( walberla::field::makeStabilityChecker< PdfField_T, FlagField_T >(globalConfig, blocks, pdfFieldCpuID, flagFieldID, FluidFlagUID )), "LBM stability check" );
+
+        // log remaining time
+        timeloop.addFuncAfterTimeStep( walberla::timing::RemainingTimeLogger( timeloop.getNrOfTimeSteps(), remainingTimeLoggerFrequency ), "Remaining time logger" );
+
+        WALBERLA_LOG_INFO_ON_ROOT("Running timeloop...")
+
+        WALBERLA_MPI_WORLD_BARRIER()
+
+        walberla::timing::TimingPool<TimingPolicy_T> timing;
+        timing.registerTimer("Force Output");
+        timing.registerTimer("Adaptive Refinement");
+
+
+        walberla::WcTimer timer;
+        timer.start();
+
+        for( uint_t i = 0; i < timesteps; ++i ) {
+
+            if( adaptiveRefinement && i > 0 && i % adaptiveFrequency == 0) {
+                timing["Adaptive Refinement"].start();
+                adaptiveRefinementStep();
+                timing["Adaptive Refinement"].end();
+            }
+
+            timeloop.singleStep(timing);
+
+            timing["Force Output"].start();
+            // farm.callback(Component::Output::ORIENTATIONS);
+            for(auto & block : *blocks) {
+                farm.writeForceOutput(&block, forceOutputStart, forceOutputFrequency);
+            }
+            farm.writeTurbinePowerAndThrust();
+            timing["Force Output"].end();
+            
+
+        }
+
+        timer.end();
+
+        double time = timer.max();
+        walberla::mpi::reduceInplace(time, walberla::mpi::MAX);
+
+        const auto timeloopTiming = timing.getReduced();
+        WALBERLA_LOG_INFO_ON_ROOT("Timeloop timing:\n" << *timeloopTiming)
+
+        walberla::lbm::PerformanceEvaluation<FlagField_T> performance(blocks, flagFieldID, FluidFlagUID);
+        performance.logResultOnRoot(timesteps, time);
+
+        farm.calculatePowerAndThrust();
+
+        logging::WindTurbineApplicationLogger<domain::DomainSetup, domain::BoundarySetup, codegen::KernelInfo, TimingPolicy_T> logger {
+            domainSetup, boundarySetup, windFarmConfig, &timing, performance.loggingString(timesteps, time)
+        };
+
+        return EXIT_SUCCESS;
+
+    } // main
+
+} // namespace turbine_core
+
+int main(int argc, char** argv) {
+    return turbine_core::main(argc, argv);
+}

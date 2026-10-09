@@ -1,0 +1,66 @@
+DomainSetup
+{
+    domainSize    <640, 640, 480>;
+    cellsPerBlock <640, 640, 160>;
+
+    outputSetupForest 0;
+
+    Refinement {
+        numLevels       0;
+        BoundaryLayer 0;
+    }
+}
+
+Parameters
+{
+    timesteps          100;
+
+    length_SI             126.0;
+    length_LU              16.0;
+
+    velocity_SI            10.0;
+    velocity_LU             0.05;
+
+    viscosity_SI           1.82e-05;
+    density_SI             1.22;
+
+    remainingTimeLoggerFrequency 5; // in seconds
+
+    roughnessLengthRatio 1e-3;
+    referenceHeight_LU   16;
+    samplingHeight_LU    4;
+    velocityFilterWidth   1e-3;
+
+    driverType          pressureGradient;
+    coriolisFrequency   -1; // given in s^-1; here: dummy value
+    geostrophicWind     <-100, -100, -100>; // given in m*s^-1, the third component should ALWAYS be 0; here: dummy value
+    windDirectionDegrees 0;
+    windDirectionChangeRateTable "windDirectionChange.wd";
+}
+
+Initialisation {
+    type asmuth; //logLaw; // uniform;
+    initialVelocity <0.05, 0, 0>;
+}
+
+Boundaries
+{
+    setup                   Open;
+
+    inflowType              Periodic;
+    outflowType             Periodic;
+
+    inflowVelocity          <0.05, 0, 0>;
+    outflowPressure         1.0;
+
+    wallType                WFB;
+}
+
+WindFarm{
+
+}
+
+Output
+{
+
+}

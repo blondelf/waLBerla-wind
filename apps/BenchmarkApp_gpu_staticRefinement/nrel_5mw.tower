@@ -1,0 +1,3 @@
+// dummy | dummy | position | dummy | dummy | dummy | radial thickness | airfoil
+0.0     0.0     0.0     0.0     0.0     0.0     3.000   airfoil_data/nrel_5mw_Cylinder1.foil
+0.0     0.0     0.0   0.0     0.0     0.0     1.935   airfoil_data/nrel_5mw_Cylinder2.foil
