@@ -416,6 +416,8 @@ def generate_output_before_functions(target: Target, vtk_output: bool, field_map
         result.append(indent + device_to_host_field_copy(Fields.VELOCITY))
         result.append(indent + device_to_host_field_copy(Fields.FORCE))
         if vtk_output:
+            if Fields.MEAN_VELOCITY in field_map:
+                result.append(indent + device_to_host_field_copy(Fields.MEAN_VELOCITY))
             if Fields.SUM_OF_SQUARES in field_map:
                 result.append(indent + device_to_host_field_copy(Fields.SUM_OF_SQUARES))
             if Fields.SUM_OF_CUBES in field_map:
